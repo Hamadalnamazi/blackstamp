@@ -1,0 +1,4 @@
+.env
+data/
+exports/
+__pycache__/

@@ -512,40 +512,56 @@ def cmd_find(args) -> None:
     if db.execute("SELECT 1 FROM runs WHERE imported = 0").fetchone():
         sys.exit("Another run is not collected yet. Finish it first with: python3 tracker.py run")
     per_shop = (cfg.get("prices_usd") or {}).get("per_shop", 0.006)
-    cap = args.max_cost
-    print("About to start a paid Apify run:")
+    categories = cfg.get("category_filter") if args.coffee_only else None
+    print("About to start paid Apify runs, one for each name:")
     print(f"  names        : {', '.join(args.names)}")
-    print(f"  places       : shops in the search area with one of these names in their title, "
-          f"up to {args.limit} per name")
-    print(f"  cost         : ${per_shop} per shop found, so at most about ${len(args.names) * args.limit * per_shop:.2f}")
-    print(f"  cost cap     : ${cap:.2f}")
+    print(f"  places       : {'coffee shops' if categories else 'places'} in the search area with the name in "
+          f"their title, up to {args.limit} per name")
+    print(f"  cost         : about ${per_shop} per shop found; a shop found under two names is paid for twice")
+    print(f"  cost cap     : ${min(len(args.names) * args.limit * per_shop, args.max_cost):.2f} for all names together")
     if not args.yes and input("Start? [y/N] ").strip().lower() not in ("y", "yes"):
         print("Cancelled. Nothing was started.")
         return
 
-    # No category filter: a branch can be listed on Google under an unexpected category.
-    actor_input = {"searchStringsArray": args.names, "searchMatching": "only_includes",
-                   "customGeolocation": cfg["search_area"], "language": cfg.get("language", "en"),
-                   "scrapePlaceDetailPage": True, "maxCrawledPlacesPerSearch": args.limit}
+    actor_input = {"searchMatching": "only_includes", "customGeolocation": cfg["search_area"],
+                   "language": cfg.get("language", "en"), "scrapePlaceDetailPage": True,
+                   "maxCrawledPlacesPerSearch": args.limit}
+    if categories:
+        actor_input["categoryFilterWords"] = categories
     actor = cfg.get("actor", "compass/crawler-google-places").replace("/", "~")
-    run = api("POST", f"/acts/{actor}/runs", token, {"maxTotalChargeUsd": cap}, actor_input)["data"]
-    db.execute(
-        "INSERT INTO runs (run_id, dataset_id, started_at, status, is_full, max_cost_usd) VALUES (?,?,?,?,0,?)",
-        (run["id"], run["defaultDatasetId"], run["startedAt"], run["status"], cap),
-    )
-    db.commit()
-    print(f"Started run {run['id']}: https://console.apify.com/actors/runs/{run['id']}")
-    if not wait_and_collect(db, token, run["id"], interactive=not args.yes):
-        return
+    run_ids, left = [], args.max_cost
+    for position, name in enumerate(args.names):
+        if left < 0.25:
+            print(f"The cost cap is used up. Not searched: {', '.join(args.names[position:])}")
+            break
+        # One run per name. In a shared run the actor skips a shop whose title does not match the first
+        # name, and then never checks it against the other names.
+        run = api("POST", f"/acts/{actor}/runs", token, {"maxTotalChargeUsd": round(left, 2)},
+                  {**actor_input, "searchStringsArray": [name]})["data"]
+        db.execute(
+            "INSERT INTO runs (run_id, dataset_id, started_at, status, is_full, max_cost_usd) VALUES (?,?,?,?,0,?)",
+            (run["id"], run["defaultDatasetId"], run["startedAt"], run["status"], round(left, 2)),
+        )
+        db.commit()
+        print(f'Searching for "{name}": https://console.apify.com/actors/runs/{run["id"]}')
+        if not wait_and_collect(db, token, run["id"], interactive=False):
+            print(f"Not searched: {', '.join(args.names[position + 1:]) or 'nothing, this was the last name'}")
+            return
+        run_ids.append(run["id"])
+        left -= db.execute("SELECT cost_usd FROM runs WHERE run_id = ?", (run["id"],)).fetchone()[0] or 0
+
+    marks = ",".join("?" * len(run_ids))
     found = db.execute(
-        "SELECT p.title, p.neighborhood, s.rating, s.reviews_count, "
-        "(SELECT COUNT(*) FROM snapshots s2 WHERE s2.place_id = p.place_id) AS times_seen "
-        "FROM snapshots s JOIN places p USING (place_id) WHERE s.run_id = ? ORDER BY s.reviews_count DESC",
-        (run["id"],)).fetchall()
+        "SELECT p.title, p.neighborhood, s.rating, s.reviews_count, NOT EXISTS (SELECT 1 FROM snapshots s2 "
+        f"WHERE s2.place_id = p.place_id AND s2.run_id NOT IN ({marks})) AS is_new "
+        f"FROM places p JOIN snapshots s USING (place_id) WHERE s.run_id IN ({marks}) "
+        "GROUP BY p.place_id ORDER BY s.reviews_count DESC", run_ids * 2).fetchall()
     for row in found:
-        print(f"  {'NEW    ' if row['times_seen'] == 1 else 'known  '} {row['title']} | {row['neighborhood'] or '-'} | "
-              f"rating {row['rating'] or '-'} | {row['reviews_count'] or 0} reviews")
-    print(f"{sum(row['times_seen'] == 1 for row in found)} of these {len(found)} shops were not in the tracker before.")
+        if row["is_new"]:
+            print(f"  NEW  {row['title']} | {row['neighborhood'] or '-'} | rating {row['rating'] or '-'} | "
+                  f"{row['reviews_count'] or 0} reviews")
+    new = sum(row["is_new"] for row in found)
+    print(f"Found {len(found)} shops for ${args.max_cost - left:.2f}: {new} new, {len(found) - new} already in the tracker.")
     cmd_export(args)
 
 
@@ -743,7 +759,9 @@ def main() -> None:
     find = sub.add_parser("find", help="search for shops by name and add the ones the wide run missed")
     find.add_argument("names", nargs="+", help='shop or brand names as written on Google Maps, e.g. "بلاك ستامب"')
     find.add_argument("--limit", type=int, default=20, help="most shops to take per name (default: 20)")
-    find.add_argument("--max-cost", type=float, default=1.0, help="cost cap in USD for this run (default: 1)")
+    find.add_argument("--max-cost", type=float, default=1.0, help="cost cap in USD for all names together (default: 1)")
+    find.add_argument("--coffee-only", action="store_true",
+                      help="keep only places Google lists as a coffee shop; use it for general words such as محمصة")
     find.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     find.set_defaults(func=cmd_find)
 
