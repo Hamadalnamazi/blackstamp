@@ -1,0 +1,16 @@
+---
+description: Keep PLAN.md up to date and remind the user of the next step
+alwaysApply: true
+---
+
+# Project plan
+
+`PLAN.md` in the project root holds the steps of this project and their status.
+
+- Read `PLAN.md` at the start of a conversation, before doing project work.
+- When a step finishes, update its status and the "Current step / Next step" line in `PLAN.md`,
+  then tell the user which step was finished and which step comes next.
+- When the user decides something that changes the plan (scope, budget, settings), record it
+  under "Decisions made". Record new measurements (shop counts, costs) under "Measured so far".
+- The user is a business owner, not a developer. Write in plain, simple English, give exact
+  commands to run, and state the cost before any paid Apify run.

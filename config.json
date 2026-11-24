@@ -1,0 +1,37 @@
+{
+  "actor": "compass/crawler-google-places",
+  "search_terms": ["coffee shop", "مقهى"],
+  "category_filter": [
+    "coffee shop",
+    "cafe",
+    "coffee store",
+    "coffee roasters",
+    "coffee stand",
+    "espresso bar",
+    "tea and coffee shop"
+  ],
+  "language": "ar",
+  "search_area": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [46.45, 24.40],
+        [47.05, 24.40],
+        [47.05, 25.05],
+        [46.45, 25.05],
+        [46.45, 24.40]
+      ]
+    ]
+  },
+  "reviews": {
+    "enabled": false,
+    "first_run_period": "1 day",
+    "overlap_days": 2,
+    "include_reviewer_names": true
+  },
+  "max_cost_usd_per_run": 100,
+  "prices_usd": {
+    "per_review": 0.0005,
+    "per_shop_with_reviews": 0.005
+  }
+}
