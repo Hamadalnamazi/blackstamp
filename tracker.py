@@ -9,6 +9,7 @@ so changes can be compared over time.
   python3 tracker.py run               full run
   python3 tracker.py reviews --top 300 one year of reviews for chosen shops (also --file, --all, --period)
   python3 tracker.py find "NAME"       add shops the wide run missed, by searching for their name
+  python3 tracker.py around LAT LNG    mosques, schools, offices and malls around a branch, with busy hours
   python3 tracker.py continue          carry on the last run if it stopped at the cost cap
   python3 tracker.py export            write CSV files to exports/
   python3 tracker.py status            list runs and totals
@@ -21,6 +22,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import sqlite3
@@ -53,7 +55,8 @@ CREATE TABLE IF NOT EXISTS runs (
     charged_events TEXT,
     places INTEGER,
     new_reviews INTEGER,
-    imported INTEGER DEFAULT 0
+    imported INTEGER DEFAULT 0,
+    kind TEXT                     -- "around" = places near a branch that are not coffee shops; empty for the rest
 );
 CREATE TABLE IF NOT EXISTS places (
     place_id TEXT PRIMARY KEY,
@@ -82,6 +85,22 @@ CREATE TABLE IF NOT EXISTS reviews (
     first_seen_run TEXT
 );
 CREATE INDEX IF NOT EXISTS reviews_place ON reviews (place_id, published_at);
+CREATE TABLE IF NOT EXISTS place_texts (
+    place_id TEXT PRIMARY KEY,
+    review_words TEXT,            -- the words Google shows as most used in the shop's reviews (JSON list)
+    owner_description TEXT        -- what the shop says about itself on Google
+);
+-- Mosques, schools, offices and malls around a branch (the `around` command). They are kept apart from the
+-- coffee shops so that they never enter the shop counts.
+CREATE TABLE IF NOT EXISTS nearby_places (
+    place_id TEXT PRIMARY KEY, run_id TEXT, search TEXT,
+    title TEXT, category TEXT, categories TEXT, address TEXT, lat REAL, lng REAL,
+    rating REAL, reviews_count INTEGER, opening_hours TEXT, url TEXT
+);
+CREATE TABLE IF NOT EXISTS nearby_times (
+    place_id TEXT, day TEXT, hour INTEGER, occupancy_percent INTEGER,
+    PRIMARY KEY (place_id, day, hour)
+);
 """
 
 
@@ -119,6 +138,8 @@ def open_db(root: Path = ROOT) -> sqlite3.Connection:
     db = sqlite3.connect(str(root / "data" / "tracker.db"))
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    if "kind" not in {column["name"] for column in db.execute("PRAGMA table_info(runs)")}:
+        db.execute("ALTER TABLE runs ADD COLUMN kind TEXT")  # databases made before the `around` command
     return db
 
 
@@ -252,6 +273,17 @@ def as_json(value) -> str | None:
     return json.dumps(value, ensure_ascii=False) if value else None
 
 
+def save_texts(db: sqlite3.Connection, item: dict) -> None:
+    """Keep the shop's review words and own description. A run that has none leaves the older ones in place."""
+    words = [tag["title"] for tag in item.get("reviewsTags") or [] if isinstance(tag, dict) and tag.get("title")]
+    db.execute(
+        "INSERT INTO place_texts VALUES (?,?,?) ON CONFLICT(place_id) DO UPDATE SET "
+        "review_words = COALESCE(excluded.review_words, review_words), "
+        "owner_description = COALESCE(excluded.owner_description, owner_description)",
+        (item["placeId"], as_json(words), item.get("ownerDescription") or None),
+    )
+
+
 def import_items(db: sqlite3.Connection, run_id: str, items) -> tuple[int, int]:
     place_ids = set()
     for item in items:
@@ -259,6 +291,7 @@ def import_items(db: sqlite3.Connection, run_id: str, items) -> tuple[int, int]:
         if not place_id:
             continue
         place_ids.add(place_id)
+        save_texts(db, item)
         location = item.get("location") or {}
         db.execute(
             "INSERT OR REPLACE INTO places VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -300,6 +333,32 @@ def import_items(db: sqlite3.Connection, run_id: str, items) -> tuple[int, int]:
     return len(place_ids), new_reviews
 
 
+def import_nearby(db: sqlite3.Connection, run_id: str, items) -> tuple[int, int]:
+    """Save the places of an `around` run with their busy hours."""
+    place_ids = set()
+    for item in items:
+        place_id = item.get("placeId")
+        if not place_id:
+            continue
+        place_ids.add(place_id)
+        location = item.get("location") or {}
+        db.execute(
+            "INSERT OR REPLACE INTO nearby_places VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (place_id, run_id, item.get("searchString"), item.get("title"), item.get("categoryName"),
+             as_json(item.get("categories")), item.get("address"), location.get("lat"), location.get("lng"),
+             item.get("totalScore"), item.get("reviewsCount"), as_json(item.get("openingHours")), item.get("url")),
+        )
+        db.execute("DELETE FROM nearby_times WHERE place_id = ?", (place_id,))
+        histogram = item.get("popularTimesHistogram")
+        if isinstance(histogram, dict):
+            for day, hours in histogram.items():
+                for entry in hours or []:
+                    if isinstance(entry, dict) and entry.get("hour") is not None:
+                        db.execute("INSERT OR REPLACE INTO nearby_times VALUES (?,?,?,?)",
+                                   (place_id, day, entry["hour"], entry.get("occupancyPercent")))
+    return len(place_ids), 0
+
+
 def hit_cap(cost: float | None, cap: float | None) -> bool:
     """The actor stops charging just below the cap, so allow a small margin."""
     return bool(cap and cost and cost >= cap - max(0.02 * cap, 0.05))
@@ -314,7 +373,10 @@ def finish_run(db: sqlite3.Connection, token: str, run: dict, root: Path = ROOT)
     run_id = run["id"]
     raw_path = root / "data" / "raw" / f"{run_id}.jsonl"
     print("Downloading results...", flush=True)
-    places, new_reviews = import_items(db, run_id, iter_dataset_items(token, run["defaultDatasetId"], raw_path))
+    row = db.execute("SELECT kind FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+    nearby = bool(row) and row["kind"] == "around"
+    importer = import_nearby if nearby else import_items
+    places, new_reviews = importer(db, run_id, iter_dataset_items(token, run["defaultDatasetId"], raw_path))
 
     cost, cap = run.get("usageTotalUsd"), run_cap(db, run)
     capped = hit_cap(cost, cap)
@@ -329,8 +391,8 @@ def finish_run(db: sqlite3.Connection, token: str, run: dict, root: Path = ROOT)
 
     cost_text = f"${cost:.2f}" if cost is not None else "see Apify console"
     print(f"Run {run_id}: {run['status']}. {places} places, {new_reviews} new reviews, cost {cost_text}.")
-    with_times = db.execute("SELECT COUNT(DISTINCT place_id) FROM popular_times WHERE run_id = ?",
-                            (run_id,)).fetchone()[0]
+    times = "nearby_times JOIN nearby_places USING (place_id)" if nearby else "popular_times"
+    with_times = db.execute(f"SELECT COUNT(DISTINCT place_id) FROM {times} WHERE run_id = ?", (run_id,)).fetchone()[0]
     print(f"Popular times were available for {with_times} of {places} places.")
     if not complete:
         reason = f"stopped at the ${cap:.2f} cost cap" if capped else "did not finish normally"
@@ -565,6 +627,45 @@ def cmd_find(args) -> None:
     cmd_export(args)
 
 
+def circle(lat: float, lng: float, km: float, points: int = 24) -> dict:
+    """A circle around a map point, as the polygon the actor takes for its search area."""
+    ring = [[lng + km / (111.32 * math.cos(math.radians(lat))) * math.cos(2 * math.pi * i / points),
+             lat + km / 110.8 * math.sin(2 * math.pi * i / points)] for i in range(points)]
+    return {"type": "Polygon", "coordinates": [ring + ring[:1]]}
+
+
+def cmd_around(args) -> None:
+    """Collect the places around a point (mosques, schools, offices, malls) with their busy hours."""
+    cfg, token, db = load_config(), load_token(), open_db()
+    if db.execute("SELECT 1 FROM runs WHERE imported = 0").fetchone():
+        sys.exit("Another run is not collected yet. Finish it first with: python3 tracker.py run")
+    per_place = (cfg.get("prices_usd") or {}).get("per_place_without_filter", 0.005)
+    print("About to start a paid Apify run:")
+    print(f"  searches     : {', '.join(args.terms)}")
+    print(f"  area         : {args.km:g} km around {args.lat}, {args.lng}")
+    print(f"  places       : up to {args.limit} for each search")
+    print(f"  cost         : about ${per_place} per place, so at most "
+          f"${min(len(args.terms) * args.limit * per_place, args.max_cost):.2f}")
+    print(f"  cost cap     : ${args.max_cost:.2f}")
+    if not args.yes and input("Start? [y/N] ").strip().lower() not in ("y", "yes"):
+        print("Cancelled. Nothing was started.")
+        return
+
+    actor_input = {"searchStringsArray": args.terms, "customGeolocation": circle(args.lat, args.lng, args.km),
+                   "language": cfg.get("language", "en"), "scrapePlaceDetailPage": True,
+                   "maxCrawledPlacesPerSearch": args.limit}
+    actor = cfg.get("actor", "compass/crawler-google-places").replace("/", "~")
+    run = api("POST", f"/acts/{actor}/runs", token, {"maxTotalChargeUsd": args.max_cost}, actor_input)["data"]
+    db.execute(
+        "INSERT INTO runs (run_id, dataset_id, started_at, status, is_full, max_cost_usd, kind) "
+        "VALUES (?,?,?,?,0,?,'around')",
+        (run["id"], run["defaultDatasetId"], run["startedAt"], run["status"], args.max_cost),
+    )
+    db.commit()
+    print(f"Started run {run['id']}: https://console.apify.com/actors/runs/{run['id']}")
+    wait_and_collect(db, token, run["id"], interactive=False)
+
+
 def cmd_continue(args) -> None:
     token, db = load_token(), open_db()
     row = db.execute("SELECT * FROM runs ORDER BY started_at DESC LIMIT 1").fetchone()
@@ -764,6 +865,17 @@ def main() -> None:
                       help="keep only places Google lists as a coffee shop; use it for general words such as محمصة")
     find.add_argument("--yes", action="store_true", help="do not ask for confirmation")
     find.set_defaults(func=cmd_find)
+
+    around = sub.add_parser("around", help="collect mosques, schools, offices and malls around a point, with busy hours")
+    around.add_argument("lat", type=float, help="latitude of the branch, e.g. 24.7054")
+    around.add_argument("lng", type=float, help="longitude of the branch, e.g. 46.7829")
+    around.add_argument("--km", type=float, default=1.5, help="how far around the point to look (default: 1.5)")
+    around.add_argument("--terms", nargs="+", default=["مسجد", "مدرسة", "شركة", "مول"],
+                        help="what to search for (default: mosque, school, company, mall, in Arabic)")
+    around.add_argument("--limit", type=int, default=100, help="most places to take per search (default: 100)")
+    around.add_argument("--max-cost", type=float, default=2.5, help="cost cap in USD (default: 2.5)")
+    around.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    around.set_defaults(func=cmd_around)
 
     cont = sub.add_parser("continue", help="carry on the last run from where it stopped (cost cap or failure)")
     cont.add_argument("--max-cost", type=float, help="new total cost cap in USD for the run")
